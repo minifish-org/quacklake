@@ -1,0 +1,18 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+aws-config.workspace = true
+aws-sdk-s3.workspace = true
+http.workspace = true
+bytes.workspace = true
+tokio-util = { version = "0.7", features = ["io"] }

@@ -1,0 +1,73 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc mb local/lakehouse || true;
+      /usr/bin/mc anonymous set public local/lakehouse;
+      exit 0;
+      "
+
+  gateway:
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    environment:
+      RUST_LOG: info
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+    depends_on:
+      - minio
+    ports:
+      - "8080:8080"
+
+  runner:
+    build:
+      context: ./runner
+    environment:
+      PORT: 3000
+    ports:
+      - "3000:3000"
+
+  api:
+    build:
+      context: .
+      dockerfile: control-plane/Dockerfile
+    environment:
+      RUST_LOG: info
+      API_PORT: 8000
+      RUNNER_URL: http://runner:3000
+      GATEWAY_BASE_URL: http://gateway:8080
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: lakehouse
+      S3_ACCESS_KEY_ID: minioadmin
+      S3_SECRET_ACCESS_KEY: minioadmin
+      DEFAULT_MAX_SECONDS: 20
+      DEFAULT_MAX_SCAN_BYTES: 268435456
+      DEFAULT_MAX_OUTPUT_BYTES: 67108864
+      DEFAULT_MAX_MEMORY_MB: 512
+      DEFAULT_READ_PREFIXES: demo/,datasets/public/
+      DEFAULT_WRITE_PREFIXES: agent/
+    depends_on:
+      - minio
+      - runner
+      - gateway
+      - createbuckets
+    ports:
+      - "8000:8000"
