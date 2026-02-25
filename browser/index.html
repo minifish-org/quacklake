@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DuckLake Browser WASM</title>
+  <style>
+    :root {
+      --bg: #f8f7f2;
+      --ink: #1b1f23;
+      --muted: #5f6770;
+      --panel: #fffef9;
+      --line: #d6d2c8;
+      --accent: #0f766e;
+    }
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: linear-gradient(120deg, #f8f7f2, #e8efe5);
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    p {
+      margin: 0 0 16px;
+      color: var(--muted);
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      margin-top: 12px;
+    }
+    label { display: block; font-weight: 600; margin-bottom: 6px; }
+    input, textarea, button {
+      font: inherit;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+    }
+    input, textarea {
+      width: 100%;
+      padding: 10px;
+      box-sizing: border-box;
+      background: #fff;
+    }
+    textarea {
+      min-height: 110px;
+      resize: vertical;
+    }
+    button {
+      margin-top: 10px;
+      padding: 10px 14px;
+      cursor: pointer;
+      border-color: #0a5a53;
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+    }
+    pre {
+      margin: 0;
+      background: #111827;
+      color: #f9fafb;
+      border-radius: 8px;
+      padding: 10px;
+      overflow: auto;
+      font-size: 12px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 8px;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 6px;
+      text-align: left;
+      white-space: nowrap;
+    }
+    .ok { color: #047857; }
+    .err { color: #b91c1c; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>DuckLake Browser WASM Query</h1>
+    <p>DuckDB-WASM runs in your browser and reads parquet via the Rust gateway URL.</p>
+
+    <section class="panel">
+      <label for="parquetUrl">Parquet URL</label>
+      <input id="parquetUrl" value="http://localhost:8080/objects/lakehouse/demo/events.parquet" />
+
+      <label for="sql" style="margin-top:10px">SQL (use <code>$PARQUET_URL</code> placeholder)</label>
+      <textarea id="sql">select event_type, count(*) as n from read_parquet('$PARQUET_URL') group by 1 order by 2 desc</textarea>
+
+      <button id="runBtn">Run Query in Browser</button>
+    </section>
+
+    <section class="panel">
+      <strong>Status:</strong> <span id="status">idle</span>
+      <pre id="log" style="margin-top:8px"></pre>
+    </section>
+
+    <section class="panel">
+      <strong>Result</strong>
+      <div id="result"></div>
+    </section>
+  </main>
+
+  <script type="module" src="./main.js"></script>
+</body>
+</html>

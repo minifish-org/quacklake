@@ -5,8 +5,9 @@ Single-machine Docker Compose prototype for a WASM-first analytics Agent DB.
 ## Services
 
 - `api` (`:8000`): Rust Axum control plane (`POST /v1/run_sql`, `GET /v1/lineage/{job_id}`)
-- `gateway` (`:8080`): Rust HTTP Range proxy over MinIO
+- `gateway` (`:8080`): Rust HTTP Range proxy over MinIO (CORS enabled for browser reads)
 - `runner` (`:3000`): Node + DuckDB WASM execution (`POST /execute`)
+- `browser` (`:8081`): Browser DuckDB-WASM playground (reads parquet via gateway)
 - `minio` (`:9000`, console `:9001`): S3-compatible object store
 
 ## Quickstart
@@ -16,13 +17,17 @@ docker compose up --build
 ./scripts/seed.sh
 ```
 
+## Browser WASM mode
+
+Open [http://localhost:8081](http://localhost:8081), keep the default parquet URL, and run the query. DuckDB-WASM runs in the browser and reads parquet over the gateway.
+
 ## Smoke Test
 
 ```bash
 ./scripts/smoke.sh
 ```
 
-Run a query:
+Run a policy-governed API query:
 
 ```bash
 curl -sS -X POST http://localhost:8000/v1/run_sql \
@@ -48,9 +53,13 @@ Fetch lineage:
 curl -sS http://localhost:8000/v1/lineage/<job_id> | jq .
 ```
 
-## Behavior
+## Homelab split deployment
 
-- API enforces default budgets and prefix-based capabilities.
-- API rewrites `s3://...` SQL references to gateway HTTP URLs before runner execution.
-- Gateway supports `HEAD`, full object reads, and byte-range reads (`206` + `Content-Range`).
-- Runner is stateless and executes SQL with DuckDB WASM, exporting result artifacts as parquet bytes.
+You can deploy storage/control and compute separately:
+
+- Storage side: `minio` + `gateway`
+- Control side: `api`
+- Compute side: `runner` (optional for governed materialization)
+- Browser analytics: `browser` app or your own frontend using DuckDB-WASM
+
+For browser reads, expose gateway over HTTPS and allow CORS with `Range`, `Content-Range`, and `Content-Length` headers.

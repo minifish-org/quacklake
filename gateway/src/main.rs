@@ -11,6 +11,7 @@ use axum::{
     Router,
 };
 use tokio_util::io::ReaderStream;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 
 #[derive(Clone)]
@@ -51,6 +52,17 @@ async fn main() {
         .route(
             "/objects/{bucket}/{*key}",
             get(proxy_object).head(proxy_object),
+        )
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
+                .allow_headers([header::RANGE, header::CONTENT_TYPE])
+                .expose_headers([
+                    header::ACCEPT_RANGES,
+                    header::CONTENT_RANGE,
+                    header::CONTENT_LENGTH,
+                ]),
         )
         .with_state(app_state);
 

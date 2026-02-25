@@ -44,6 +44,14 @@ services:
     ports:
       - "3000:3000"
 
+  browser:
+    build:
+      context: ./browser
+    depends_on:
+      - gateway
+    ports:
+      - "8081:8081"
+
   api:
     build:
       context: .
