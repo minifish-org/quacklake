@@ -1,21 +1,26 @@
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{config::Credentials, primitives::ByteStream, Client};
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use regex::Regex;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::timeout,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -24,13 +29,16 @@ struct AppState {
     runner_url: String,
     gateway_base_url: String,
     s3_bucket: String,
+    api_keys: Vec<String>,
+    jwt_hs256_secret: Option<String>,
     default_budget: BudgetV1,
     read_prefixes: Vec<String>,
     write_prefixes: Vec<String>,
     uri_regex: Regex,
-    s3: Client,
-    http: HttpClient,
+    object_store: Arc<dyn ObjectStore>,
+    runner: Arc<dyn RunnerExecutor>,
     lineage: Arc<Mutex<HashMap<Uuid, LineageRecordV1>>>,
+    job_limit: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +117,7 @@ struct ErrorBodyV1 {
     suggestions: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct MeasuredUsageV1 {
     budget: &'static str,
     actual: u64,
@@ -122,7 +130,7 @@ struct RunnerRequest {
     output_format: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RunnerResponse {
     artifact_base64: String,
     elapsed_ms: u64,
@@ -130,7 +138,116 @@ struct RunnerResponse {
     peak_memory_mb: u64,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Deserialize)]
+struct JwtClaims {
+    sub: Option<String>,
+    exp: Option<usize>,
+}
+
+#[async_trait]
+trait ObjectStore: Send + Sync {
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<u64, String>;
+    async fn put_object(&self, bucket: &str, key: &str, bytes: Vec<u8>) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+struct S3ObjectStore {
+    s3: Client,
+}
+
+#[async_trait]
+impl ObjectStore for S3ObjectStore {
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<u64, String> {
+        let head = self
+            .s3
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(head.content_length().unwrap_or(0).max(0) as u64)
+    }
+
+    async fn put_object(&self, bucket: &str, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+        self.s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_type("application/octet-stream")
+            .body(ByteStream::from(bytes))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+trait RunnerExecutor: Send + Sync {
+    async fn execute(
+        &self,
+        runner_url: &str,
+        request: &RunnerRequest,
+        max_seconds: u64,
+    ) -> Result<RunnerResponse, ApiError>;
+}
+
+#[derive(Clone)]
+struct HttpRunner {
+    http: HttpClient,
+    auth_tokens: Vec<String>,
+}
+
+#[async_trait]
+impl RunnerExecutor for HttpRunner {
+    async fn execute(
+        &self,
+        runner_url: &str,
+        request: &RunnerRequest,
+        max_seconds: u64,
+    ) -> Result<RunnerResponse, ApiError> {
+        let runner_fut = self
+            .http
+            .post(format!("{runner_url}/execute"))
+            .json(request);
+        let runner_fut = if let Some(token) = self.auth_tokens.first() {
+            runner_fut.header("x-runner-token", token)
+        } else {
+            runner_fut
+        }
+        .send();
+
+        let runner_resp = timeout(Duration::from_secs(max_seconds), runner_fut)
+            .await
+            .map_err(|_| {
+                ApiError::BudgetExceeded(
+                    "query exceeded max_seconds".to_string(),
+                    MeasuredUsageV1 {
+                        budget: "max_seconds",
+                        actual: max_seconds,
+                        limit: max_seconds,
+                    },
+                )
+            })?
+            .map_err(|e| ApiError::Runner(e.to_string()))?;
+
+        if !runner_resp.status().is_success() {
+            let body = runner_resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "runner failure".to_string());
+            return Err(ApiError::Runner(body));
+        }
+
+        runner_resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Runner(e.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, Error)]
 enum ApiError {
     #[error("invalid request: {0}")]
     BadRequest(String),
@@ -142,6 +259,10 @@ enum ApiError {
     Runner(String),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    #[error("too many requests: {0}")]
+    TooManyRequests(String),
 }
 
 impl IntoResponse for ApiError {
@@ -203,6 +324,29 @@ impl IntoResponse for ApiError {
                     suggestions: vec!["Verify MinIO availability and credentials".to_string()],
                 },
             ),
+            ApiError::Unauthorized(msg) => (
+                StatusCode::UNAUTHORIZED,
+                ErrorBodyV1 {
+                    code: "unauthorized",
+                    category: "auth",
+                    message: msg,
+                    measured: None,
+                    suggestions: vec!["Include a valid x-api-key header".to_string()],
+                },
+            ),
+            ApiError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorBodyV1 {
+                    code: "too_many_requests",
+                    category: "runtime",
+                    message: msg,
+                    measured: None,
+                    suggestions: vec![
+                        "Retry shortly".to_string(),
+                        "Reduce concurrent jobs or increase MAX_CONCURRENT_JOBS".to_string(),
+                    ],
+                },
+            ),
         };
 
         (status, Json(ErrorResponseV1 { error: body })).into_response()
@@ -246,24 +390,46 @@ async fn main() {
         max_memory_mb: parse_env_u64("DEFAULT_MAX_MEMORY_MB", 512),
     };
 
+    let api_keys = parse_prefixes("API_KEYS", "");
+    let jwt_hs256_secret = env::var("JWT_HS256_SECRET")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let runner_auth_tokens = {
+        let fallback = env::var("RUNNER_AUTH_TOKEN").unwrap_or_default();
+        parse_prefixes("RUNNER_AUTH_TOKENS", &fallback)
+    };
+    let app_env = env::var("APP_ENV").unwrap_or_else(|_| "development".to_string());
+    validate_production_settings(
+        &app_env,
+        &api_keys,
+        jwt_hs256_secret.as_deref(),
+        &runner_auth_tokens,
+    );
+
     let app_state = AppState {
         runner_url,
         gateway_base_url,
         s3_bucket,
+        api_keys,
+        jwt_hs256_secret,
         default_budget,
         read_prefixes: parse_prefixes("DEFAULT_READ_PREFIXES", "demo/,datasets/public/"),
         write_prefixes: parse_prefixes("DEFAULT_WRITE_PREFIXES", "agent/"),
         uri_regex: Regex::new(r#"s3://([a-zA-Z0-9._-]+)/([a-zA-Z0-9._\-/]+)"#).expect("regex"),
-        s3: Client::from_conf(s3_config),
-        http: HttpClient::new(),
+        object_store: Arc::new(S3ObjectStore {
+            s3: Client::from_conf(s3_config),
+        }),
+        runner: Arc::new(HttpRunner {
+            http: HttpClient::new(),
+            auth_tokens: runner_auth_tokens,
+        }),
         lineage: Arc::new(Mutex::new(HashMap::new())),
+        job_limit: Arc::new(Semaphore::new(
+            parse_env_u64("MAX_CONCURRENT_JOBS", 8) as usize
+        )),
     };
 
-    let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/run_sql", post(run_sql_v1))
-        .route("/v1/lineage/{job_id}", get(get_lineage_v1))
-        .with_state(app_state);
+    let app = build_router(app_state);
 
     let addr: SocketAddr = format!("0.0.0.0:{api_port}").parse().expect("addr");
     info!(%addr, "control-plane listening");
@@ -271,10 +437,26 @@ async fn main() {
     axum::serve(listener, app).await.expect("serve");
 }
 
+fn build_router(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/v1/run_sql", post(run_sql_v1))
+        .route("/v1/lineage/{job_id}", get(get_lineage_v1))
+        .with_state(state)
+}
+
 async fn run_sql_v1(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RunSqlRequestV1>,
 ) -> Result<Json<RunSqlResponseV1>, ApiError> {
+    ensure_request_auth(&state.api_keys, state.jwt_hs256_secret.as_deref(), &headers)?;
+    let _permit = state
+        .job_limit
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::TooManyRequests("concurrency limit reached".to_string()))?;
+
     if req.output.format.to_lowercase() != "parquet" {
         return Err(ApiError::BadRequest(
             "only parquet output is supported in v1".to_string(),
@@ -301,16 +483,12 @@ async fn run_sql_v1(
     let mut estimated_scan_bytes = 0u64;
     for uri in &input_uris {
         let (bucket, key) = split_s3_uri(uri)?;
-        let head = state
-            .s3
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
+        let size = state
+            .object_store
+            .head_object(&bucket, &key)
             .await
-            .map_err(|e| ApiError::Storage(e.to_string()))?;
-        estimated_scan_bytes =
-            estimated_scan_bytes.saturating_add(head.content_length().unwrap_or(0).max(0) as u64);
+            .map_err(ApiError::Storage)?;
+        estimated_scan_bytes = estimated_scan_bytes.saturating_add(size);
     }
 
     if estimated_scan_bytes > budget.max_scan_bytes {
@@ -331,38 +509,10 @@ async fn run_sql_v1(
         output_format: "parquet".to_string(),
     };
 
-    let runner_fut = state
-        .http
-        .post(format!("{}/execute", state.runner_url))
-        .json(&runner_req)
-        .send();
-
-    let runner_resp = timeout(Duration::from_secs(budget.max_seconds), runner_fut)
-        .await
-        .map_err(|_| {
-            ApiError::BudgetExceeded(
-                "query exceeded max_seconds".to_string(),
-                MeasuredUsageV1 {
-                    budget: "max_seconds",
-                    actual: budget.max_seconds,
-                    limit: budget.max_seconds,
-                },
-            )
-        })?
-        .map_err(|e| ApiError::Runner(e.to_string()))?;
-
-    if !runner_resp.status().is_success() {
-        let body = runner_resp
-            .text()
-            .await
-            .unwrap_or_else(|_| "runner failure".to_string());
-        return Err(ApiError::Runner(body));
-    }
-
-    let runner_payload: RunnerResponse = runner_resp
-        .json()
-        .await
-        .map_err(|e| ApiError::Runner(e.to_string()))?;
+    let runner_payload = state
+        .runner
+        .execute(&state.runner_url, &runner_req, budget.max_seconds)
+        .await?;
 
     if runner_payload.bytes_scanned > budget.max_scan_bytes {
         return Err(ApiError::BudgetExceeded(
@@ -402,15 +552,10 @@ async fn run_sql_v1(
     }
 
     state
-        .s3
-        .put_object()
-        .bucket(&state.s3_bucket)
-        .key(&req.output.s3_key)
-        .content_type("application/octet-stream")
-        .body(ByteStream::from(artifact_bytes.clone()))
-        .send()
+        .object_store
+        .put_object(&state.s3_bucket, &req.output.s3_key, artifact_bytes.clone())
         .await
-        .map_err(|e| ApiError::Storage(e.to_string()))?;
+        .map_err(ApiError::Storage)?;
 
     let artifact = ArtifactV1 {
         s3_uri: format!("s3://{}/{}", state.s3_bucket, req.output.s3_key),
@@ -460,8 +605,11 @@ async fn run_sql_v1(
 
 async fn get_lineage_v1(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(job_id): Path<Uuid>,
 ) -> Result<Json<LineageRecordV1>, ApiError> {
+    ensure_request_auth(&state.api_keys, state.jwt_hs256_secret.as_deref(), &headers)?;
+
     let lineage = state.lineage.lock().await;
     let record = lineage
         .get(&job_id)
@@ -477,9 +625,12 @@ fn parse_env_u64(name: &str, default: u64) -> u64 {
 }
 
 fn parse_prefixes(name: &str, fallback: &str) -> Vec<String> {
-    env::var(name)
-        .unwrap_or_else(|_| fallback.to_string())
-        .split(',')
+    let raw = env::var(name).unwrap_or_else(|_| fallback.to_string());
+    parse_prefix_list(&raw)
+}
+
+fn parse_prefix_list(raw: &str) -> Vec<String> {
+    raw.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
@@ -525,10 +676,154 @@ fn rewrite_sql_s3_to_gateway(uri_regex: &Regex, gateway_base_url: &str, sql: &st
         .to_string()
 }
 
+fn ensure_request_auth(
+    api_keys: &[String],
+    jwt_secret: Option<&str>,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    if let Some(secret) = jwt_secret {
+        if let Some(token) = bearer_token(headers) {
+            let mut validation = Validation::new(Algorithm::HS256);
+            validation.validate_exp = true;
+            let claims = decode::<JwtClaims>(
+                token,
+                &DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            )
+            .map_err(|_| ApiError::Unauthorized("invalid bearer token".to_string()))?;
+            let _ = (&claims.claims.sub, &claims.claims.exp);
+            return Ok(());
+        }
+    }
+
+    if !api_keys.is_empty() {
+        let Some(provided) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) else {
+            return Err(ApiError::Unauthorized(
+                "missing x-api-key header".to_string(),
+            ));
+        };
+
+        if api_keys.iter().any(|k| k == provided) {
+            return Ok(());
+        }
+        return Err(ApiError::Unauthorized("invalid x-api-key".to_string()));
+    }
+
+    if jwt_secret.is_some() {
+        return Err(ApiError::Unauthorized(
+            "missing Authorization bearer token".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    auth.strip_prefix("Bearer ")
+}
+
+fn validate_production_settings(
+    app_env: &str,
+    api_keys: &[String],
+    jwt_secret: Option<&str>,
+    runner_auth_tokens: &[String],
+) {
+    if app_env != "production" {
+        return;
+    }
+    if api_keys.is_empty() && jwt_secret.is_none() {
+        panic!("production mode requires API_KEYS or JWT_HS256_SECRET");
+    }
+    if runner_auth_tokens.is_empty() {
+        panic!("production mode requires RUNNER_AUTH_TOKENS or RUNNER_AUTH_TOKEN");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode as HttpStatusCode};
     use http_body_util::BodyExt;
+    use serde_json::json;
+    use tower::util::ServiceExt;
+
+    type PutObjects = Arc<Mutex<Vec<(String, String, Vec<u8>)>>>;
+
+    #[derive(Clone, Default)]
+    struct MockObjectStore {
+        heads: Arc<Mutex<HashMap<(String, String), u64>>>,
+        puts: PutObjects,
+        fail_put: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for MockObjectStore {
+        async fn head_object(&self, bucket: &str, key: &str) -> Result<u64, String> {
+            let heads = self.heads.lock().await;
+            heads
+                .get(&(bucket.to_string(), key.to_string()))
+                .copied()
+                .ok_or_else(|| "missing mock head object".to_string())
+        }
+
+        async fn put_object(&self, bucket: &str, key: &str, bytes: Vec<u8>) -> Result<(), String> {
+            if let Some(err) = self.fail_put.lock().await.clone() {
+                return Err(err);
+            }
+            self.puts
+                .lock()
+                .await
+                .push((bucket.to_string(), key.to_string(), bytes));
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct MockRunner {
+        result: Arc<Mutex<Result<RunnerResponse, ApiError>>>,
+    }
+
+    #[async_trait]
+    impl RunnerExecutor for MockRunner {
+        async fn execute(
+            &self,
+            _runner_url: &str,
+            _request: &RunnerRequest,
+            _max_seconds: u64,
+        ) -> Result<RunnerResponse, ApiError> {
+            self.result.lock().await.clone()
+        }
+    }
+
+    fn test_state(
+        store: Arc<dyn ObjectStore>,
+        runner: Arc<dyn RunnerExecutor>,
+        lineage: Arc<Mutex<HashMap<Uuid, LineageRecordV1>>>,
+        api_keys: Vec<String>,
+    ) -> AppState {
+        AppState {
+            runner_url: "http://runner:3000".to_string(),
+            gateway_base_url: "http://gateway:8080".to_string(),
+            s3_bucket: "lakehouse".to_string(),
+            api_keys,
+            jwt_hs256_secret: None,
+            default_budget: BudgetV1 {
+                max_seconds: 20,
+                max_scan_bytes: 268_435_456,
+                max_output_bytes: 67_108_864,
+                max_memory_mb: 512,
+            },
+            read_prefixes: vec!["demo/".to_string()],
+            write_prefixes: vec!["agent/".to_string()],
+            uri_regex: Regex::new(r#"s3://([a-zA-Z0-9._-]+)/([a-zA-Z0-9._\-/]+)"#).unwrap(),
+            object_store: store,
+            runner,
+            lineage,
+            job_limit: Arc::new(Semaphore::new(8)),
+        }
+    }
 
     #[test]
     fn allowed_prefix_is_enforced() {
@@ -563,6 +858,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn too_many_requests_error_shape_is_stable() {
+        let resp = ApiError::TooManyRequests("busy".to_string()).into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("valid json");
+        assert_eq!(json["error"]["code"], "too_many_requests");
+        assert_eq!(json["error"]["message"], "busy");
+    }
+
+    #[test]
+    fn production_validation_requires_auth_and_runner_token() {
+        let no_panic = std::panic::catch_unwind(|| {
+            validate_production_settings(
+                "production",
+                &["k".to_string()],
+                None,
+                &["r".to_string()],
+            );
+        });
+        assert!(no_panic.is_ok());
+
+        let missing = std::panic::catch_unwind(|| {
+            validate_production_settings("production", &[], None, &[]);
+        });
+        assert!(missing.is_err());
+    }
+
+    #[tokio::test]
     async fn budget_exceeded_error_includes_measured_usage() {
         let measured = MeasuredUsageV1 {
             budget: "max_scan_bytes",
@@ -591,5 +920,287 @@ mod tests {
     fn split_s3_uri_rejects_invalid_input() {
         let err = split_s3_uri("http://not-s3/path").expect_err("expected error");
         assert!(format!("{err}").contains("invalid s3 uri"));
+    }
+
+    #[test]
+    fn split_s3_uri_accepts_valid_input() {
+        let (bucket, key) =
+            split_s3_uri("s3://lakehouse/demo/events.parquet").expect("valid s3 uri");
+        assert_eq!(bucket, "lakehouse");
+        assert_eq!(key, "demo/events.parquet");
+    }
+
+    #[test]
+    fn parse_prefix_list_drops_empty_entries() {
+        let parsed = parse_prefix_list("demo/, datasets/public/ , ,agent/ws1/");
+        assert_eq!(parsed, vec!["demo/", "datasets/public/", "agent/ws1/"]);
+    }
+
+    #[test]
+    fn merge_budget_prefers_user_budget() {
+        let default = BudgetV1 {
+            max_seconds: 20,
+            max_scan_bytes: 100,
+            max_output_bytes: 100,
+            max_memory_mb: 128,
+        };
+        let user = BudgetV1 {
+            max_seconds: 5,
+            max_scan_bytes: 10,
+            max_output_bytes: 11,
+            max_memory_mb: 12,
+        };
+        let merged = merge_budget(Some(user.clone()), &default);
+        assert_eq!(merged.max_seconds, user.max_seconds);
+        assert_eq!(merged.max_scan_bytes, user.max_scan_bytes);
+        assert_eq!(merged.max_output_bytes, user.max_output_bytes);
+        assert_eq!(merged.max_memory_mb, user.max_memory_mb);
+    }
+
+    #[test]
+    fn merge_budget_falls_back_to_default() {
+        let default = BudgetV1 {
+            max_seconds: 20,
+            max_scan_bytes: 100,
+            max_output_bytes: 101,
+            max_memory_mb: 128,
+        };
+        let merged = merge_budget(None, &default);
+        assert_eq!(merged.max_seconds, default.max_seconds);
+        assert_eq!(merged.max_scan_bytes, default.max_scan_bytes);
+        assert_eq!(merged.max_output_bytes, default.max_output_bytes);
+        assert_eq!(merged.max_memory_mb, default.max_memory_mb);
+    }
+
+    #[test]
+    fn extract_s3_uris_finds_multiple_entries() {
+        let uri_regex = Regex::new(r#"s3://([a-zA-Z0-9._-]+)/([a-zA-Z0-9._\-/]+)"#).unwrap();
+        let sql = r#"select * from read_parquet("s3://lakehouse/demo/a.parquet")
+            union all
+            select * from read_parquet("s3://datasets/public/b.parquet")"#;
+        let uris = extract_s3_uris(&uri_regex, sql);
+        assert_eq!(
+            uris,
+            vec![
+                "s3://lakehouse/demo/a.parquet",
+                "s3://datasets/public/b.parquet"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sql_success_persists_lineage_and_writes_artifact() {
+        let store = MockObjectStore::default();
+        store.heads.lock().await.insert(
+            ("lakehouse".to_string(), "demo/events.parquet".to_string()),
+            349,
+        );
+        let store = Arc::new(store);
+        let runner = Arc::new(MockRunner {
+            result: Arc::new(Mutex::new(Ok(RunnerResponse {
+                artifact_base64: BASE64.encode(b"parquet-bytes"),
+                elapsed_ms: 12,
+                bytes_scanned: 349,
+                peak_memory_mb: 64,
+            }))),
+        });
+        let lineage = Arc::new(Mutex::new(HashMap::new()));
+        let app = build_router(test_state(store.clone(), runner, lineage.clone(), vec![]));
+
+        let req_body = json!({
+            "sql": "select count(*) as n from read_parquet(\"s3://lakehouse/demo/events.parquet\")",
+            "output": { "format": "parquet", "s3_key": "agent/ws1/results/out.parquet" }
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/run_sql")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("run_sql response");
+
+        assert_eq!(response.status(), HttpStatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let job_id = parsed["job_id"].as_str().unwrap().to_string();
+        assert!(parsed["output"]["s3_uri"]
+            .as_str()
+            .unwrap()
+            .ends_with("agent/ws1/results/out.parquet"));
+
+        let puts = store.puts.lock().await;
+        assert_eq!(puts.len(), 1);
+        assert_eq!(puts[0].0, "lakehouse");
+        assert_eq!(puts[0].1, "agent/ws1/results/out.parquet");
+        assert_eq!(puts[0].2, b"parquet-bytes");
+
+        let lineage_map = lineage.lock().await;
+        let id = Uuid::parse_str(&job_id).unwrap();
+        assert!(lineage_map.contains_key(&id));
+    }
+
+    #[tokio::test]
+    async fn run_sql_runner_timeout_returns_budget_error() {
+        let store = MockObjectStore::default();
+        store.heads.lock().await.insert(
+            ("lakehouse".to_string(), "demo/events.parquet".to_string()),
+            349,
+        );
+        let store = Arc::new(store);
+        let runner = Arc::new(MockRunner {
+            result: Arc::new(Mutex::new(Err(ApiError::BudgetExceeded(
+                "query exceeded max_seconds".to_string(),
+                MeasuredUsageV1 {
+                    budget: "max_seconds",
+                    actual: 1,
+                    limit: 1,
+                },
+            )))),
+        });
+        let app = build_router(test_state(
+            store,
+            runner,
+            Arc::new(Mutex::new(HashMap::new())),
+            vec![],
+        ));
+
+        let req_body = json!({
+            "sql": "select * from read_parquet(\"s3://lakehouse/demo/events.parquet\")",
+            "output": { "format": "parquet", "s3_key": "agent/ws1/results/out.parquet" },
+            "budget": { "max_seconds": 1, "max_scan_bytes": 99999, "max_output_bytes": 99999, "max_memory_mb": 128 }
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/run_sql")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("run_sql response");
+
+        assert_eq!(response.status(), HttpStatusCode::UNPROCESSABLE_ENTITY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], "budget_exceeded");
+        assert_eq!(parsed["error"]["measured"]["budget"], "max_seconds");
+    }
+
+    #[tokio::test]
+    async fn run_sql_storage_write_failure_returns_storage_error() {
+        let store = MockObjectStore::default();
+        store.heads.lock().await.insert(
+            ("lakehouse".to_string(), "demo/events.parquet".to_string()),
+            349,
+        );
+        *store.fail_put.lock().await = Some("disk full".to_string());
+        let store = Arc::new(store);
+        let runner = Arc::new(MockRunner {
+            result: Arc::new(Mutex::new(Ok(RunnerResponse {
+                artifact_base64: BASE64.encode(b"result"),
+                elapsed_ms: 10,
+                bytes_scanned: 100,
+                peak_memory_mb: 10,
+            }))),
+        });
+        let app = build_router(test_state(
+            store,
+            runner,
+            Arc::new(Mutex::new(HashMap::new())),
+            vec![],
+        ));
+
+        let req_body = json!({
+            "sql": "select * from read_parquet(\"s3://lakehouse/demo/events.parquet\")",
+            "output": { "format": "parquet", "s3_key": "agent/ws1/results/out.parquet" }
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/run_sql")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .expect("run_sql response");
+
+        assert_eq!(response.status(), HttpStatusCode::BAD_GATEWAY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], "storage_error");
+        assert_eq!(parsed["error"]["message"], "disk full");
+    }
+
+    #[tokio::test]
+    async fn run_sql_requires_api_key_when_configured() {
+        let store = MockObjectStore::default();
+        store.heads.lock().await.insert(
+            ("lakehouse".to_string(), "demo/events.parquet".to_string()),
+            349,
+        );
+        let store = Arc::new(store);
+        let runner = Arc::new(MockRunner {
+            result: Arc::new(Mutex::new(Ok(RunnerResponse {
+                artifact_base64: BASE64.encode(b"result"),
+                elapsed_ms: 10,
+                bytes_scanned: 100,
+                peak_memory_mb: 10,
+            }))),
+        });
+        let app = build_router(test_state(
+            store,
+            runner,
+            Arc::new(Mutex::new(HashMap::new())),
+            vec!["secret-key".to_string()],
+        ));
+
+        let req_body = json!({
+            "sql": "select * from read_parquet(\"s3://lakehouse/demo/events.parquet\")",
+            "output": { "format": "parquet", "s3_key": "agent/ws1/results/out.parquet" }
+        });
+        let response = app
+            .oneshot(
+                Request::post("/v1/run_sql")
+                    .header("content-type", "application/json")
+                    .body(Body::from(req_body.to_string()))
+                    .expect("valid request"),
+            )
+            .await
+            .expect("run_sql response");
+
+        assert_eq!(response.status(), HttpStatusCode::UNAUTHORIZED);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], "unauthorized");
+    }
+
+    #[test]
+    fn ensure_request_auth_accepts_valid_bearer_token() {
+        #[derive(Serialize)]
+        struct TestClaims {
+            sub: &'static str,
+            exp: usize,
+        }
+
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(Algorithm::HS256),
+            &TestClaims {
+                sub: "user-1",
+                exp: 4_102_444_800, // year 2100
+            },
+            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+        )
+        .expect("encode jwt");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().expect("auth header"),
+        );
+
+        let out = ensure_request_auth(&[], Some("secret"), &headers);
+        assert!(out.is_ok());
     }
 }

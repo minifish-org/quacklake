@@ -4,10 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test",
+    "test:coverage": "c8 --reporter=text --reporter=lcov node --test"
   },
   "dependencies": {
-    "@duckdb/duckdb-wasm": "^1.30.0",
-    "express": "^4.21.2"
+    "@duckdb/duckdb-wasm": "1.30.0"
+  },
+  "devDependencies": {
+    "c8": "^10.1.3"
   }
 }

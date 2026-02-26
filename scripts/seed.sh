@@ -29,7 +29,7 @@ mc_put_file() {
   fi
 }
 
-mc_cmd alias set local http://localhost:9000 minioadmin minioadmin
+mc_cmd alias set local http://127.0.0.1:9000 minioadmin minioadmin
 mc_cmd mb local/lakehouse || true
 
 workdir="$(pwd)/.tmp-seed"

@@ -22,5 +22,3 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 aws-config = "1"
 aws-sdk-s3 = "1"
 aws-smithy-types = "1"
-http = "1"
-bytes = "1"

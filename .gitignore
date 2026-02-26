@@ -1,4 +1,7 @@
 target/
 node_modules/
 .env
+.env.production
 .DS_Store
+coverage/
+runner/coverage/

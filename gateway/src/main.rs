@@ -30,6 +30,8 @@ async fn main() {
     let region = env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
     let access_key = env::var("S3_ACCESS_KEY_ID").unwrap_or_else(|_| "minioadmin".to_string());
     let secret_key = env::var("S3_SECRET_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".to_string());
+    let cors_origins =
+        env::var("CORS_ALLOWED_ORIGINS").unwrap_or_else(|_| "http://localhost:8081".to_string());
 
     let shared_config = aws_config::defaults(BehaviorVersion::latest())
         .region(aws_sdk_s3::config::Region::new(region))
@@ -55,7 +57,9 @@ async fn main() {
         )
         .layer(
             CorsLayer::new()
-                .allow_origin(Any)
+                .allow_origin(
+                    parse_cors_origins(&cors_origins).expect("invalid CORS_ALLOWED_ORIGINS"),
+                )
                 .allow_methods([Method::GET, Method::HEAD, Method::OPTIONS])
                 .allow_headers([header::RANGE, header::CONTENT_TYPE])
                 .expose_headers([
@@ -110,11 +114,7 @@ async fn proxy_object(
     let content_range = output.content_range().map(str::to_string);
     let body = Body::from_stream(ReaderStream::new(output.body.into_async_read()));
 
-    let status = if range_header.is_some() {
-        StatusCode::PARTIAL_CONTENT
-    } else {
-        StatusCode::OK
-    };
+    let status = response_status(range_header.as_deref(), content_range.as_deref());
 
     let mut resp = Response::new(body);
     *resp.status_mut() = status;
@@ -145,4 +145,81 @@ fn set_common_headers(
 fn internal<E: std::fmt::Display>(err: E) -> (StatusCode, String) {
     error!(error = %err, "gateway request failed");
     (StatusCode::BAD_GATEWAY, err.to_string())
+}
+
+fn parse_cors_origins(raw: &str) -> Result<tower_http::cors::AllowOrigin, String> {
+    let items = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+
+    if items.len() == 1 && items[0] == "*" {
+        return Ok(Any.into());
+    }
+
+    if items.is_empty() {
+        return Err("CORS_ALLOWED_ORIGINS cannot be empty".to_string());
+    }
+
+    let mut origins = Vec::with_capacity(items.len());
+    for item in items {
+        let v =
+            HeaderValue::from_str(item).map_err(|e| format!("invalid CORS origin {item}: {e}"))?;
+        origins.push(v);
+    }
+
+    Ok(origins.into())
+}
+
+fn response_status(range_header: Option<&str>, content_range: Option<&str>) -> StatusCode {
+    if range_header.is_some() && content_range.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_status_is_partial_only_with_content_range() {
+        assert_eq!(
+            response_status(Some("bytes=0-10"), Some("bytes 0-10/100")),
+            StatusCode::PARTIAL_CONTENT
+        );
+        assert_eq!(response_status(Some("bytes=0-10"), None), StatusCode::OK);
+        assert_eq!(response_status(None, None), StatusCode::OK);
+    }
+
+    #[test]
+    fn common_headers_include_accept_ranges_and_length() {
+        let mut headers = HeaderMap::new();
+        set_common_headers(&mut headers, 128).expect("set headers");
+
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_RANGES)
+                .and_then(|v| v.to_str().ok()),
+            Some("bytes")
+        );
+        assert_eq!(
+            headers
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()),
+            Some("128")
+        );
+    }
+
+    #[test]
+    fn parse_cors_origins_accepts_wildcard() {
+        assert!(parse_cors_origins("*").is_ok());
+    }
+
+    #[test]
+    fn parse_cors_origins_rejects_empty() {
+        assert!(parse_cors_origins(" , ").is_err());
+    }
 }

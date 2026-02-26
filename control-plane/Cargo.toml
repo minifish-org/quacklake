@@ -18,8 +18,9 @@ regex.workspace = true
 chrono.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
-bytes.workspace = true
 base64 = "0.22"
+async-trait = "0.1"
+jsonwebtoken = "9"
 
 [dev-dependencies]
 http-body-util = "0.1"

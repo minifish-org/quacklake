@@ -1,4 +1,7 @@
-import * as duckdb from 'https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.30.0/+esm';
+const DUCKDB_WASM_VERSION = '1.30.0';
+const duckdb = await import(
+  `https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@${DUCKDB_WASM_VERSION}/+esm`
+);
 
 const runBtn = document.getElementById('runBtn');
 const statusEl = document.getElementById('status');
@@ -76,10 +79,11 @@ function renderTable(rows) {
 runBtn.addEventListener('click', async () => {
   logEl.textContent = '';
   resultEl.innerHTML = '';
+  let conn;
 
   try {
     const db = await getDb();
-    const conn = await db.connect();
+    conn = await db.connect();
     const parquetUrl = parquetUrlEl.value.trim();
     const sql = sqlEl.value.replaceAll('$PARQUET_URL', parquetUrl);
 
@@ -91,10 +95,17 @@ runBtn.addEventListener('click', async () => {
     renderTable(rows);
 
     setStatus(`done (${rows.length} rows)`);
-    await conn.close();
   } catch (err) {
     const msg = err?.message ?? String(err);
     setStatus('failed', false);
     log(msg);
+  } finally {
+    if (conn) {
+      try {
+        await conn.close();
+      } catch (_err) {
+        // ignore close errors in UI teardown path
+      }
+    }
   }
 });

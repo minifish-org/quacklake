@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+usage() {
+  cat <<'EOF'
+ducklake helper
+
+Usage:
+  ./scripts/ducklake doctor
+  ./scripts/ducklake quickstart [--yes] [--build] [--validate]
+  ./scripts/ducklake up [--build]
+  ./scripts/ducklake down
+  ./scripts/ducklake status
+  ./scripts/ducklake seed
+  ./scripts/ducklake query [SQL]
+  ./scripts/ducklake smoke
+  ./scripts/ducklake validate
+  ./scripts/ducklake browser
+  ./scripts/ducklake logs [service]
+  ./scripts/ducklake prod-up
+  ./scripts/ducklake prod-down
+  ./scripts/ducklake completion [bash|zsh]
+EOF
+}
+
+compose_files=(-f docker-compose.yml)
+prod_compose_files=(-f docker-compose.yml -f docker-compose.production.yml)
+
+cmd="${1:-help}"
+shift || true
+
+confirm_or_skip() {
+  local prompt="$1"
+  if [ "${AUTO_YES:-0}" = "1" ]; then
+    return 0
+  fi
+  printf "%s [Y/n]: " "$prompt"
+  read -r answer
+  case "${answer:-Y}" in
+    Y|y|yes|YES|"") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_core_ready() {
+  echo "waiting for services..."
+  for i in $(seq 1 45); do
+    if curl -sf http://localhost:8000/healthz >/dev/null \
+      && curl -sf http://localhost:8080/healthz >/dev/null \
+      && curl -sf http://localhost:9000/minio/health/ready >/dev/null; then
+      echo "services ready"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "services did not become ready in time"
+  return 1
+}
+
+case "$cmd" in
+  doctor)
+    ./scripts/doctor.sh
+    ;;
+  quickstart)
+    AUTO_YES=0
+    qs_build=0
+    qs_validate=0
+    for arg in "$@"; do
+      case "$arg" in
+        --yes) AUTO_YES=1 ;;
+        --build) qs_build=1 ;;
+        --validate) qs_validate=1 ;;
+        *)
+          echo "unknown quickstart option: $arg"
+          exit 1
+          ;;
+      esac
+    done
+
+    ./scripts/doctor.sh
+    if confirm_or_skip "Start services now?"; then
+      if [ "$qs_build" = "1" ]; then
+        "$0" up --build
+      else
+        "$0" up
+      fi
+      wait_core_ready
+    fi
+    if confirm_or_skip "Seed demo dataset?"; then
+      "$0" seed
+    fi
+    if confirm_or_skip "Run sample query?"; then
+      "$0" query
+    fi
+    if [ "$qs_validate" = "1" ] && confirm_or_skip "Run full validation suite?"; then
+      "$0" validate
+    fi
+    echo "Quickstart complete. Open http://localhost:8081"
+    ;;
+  up)
+    build_arg=""
+    if [ "${1:-}" = "--build" ]; then
+      build_arg="--build"
+    fi
+    docker compose "${compose_files[@]}" up -d $build_arg minio createbuckets gateway runner api browser
+    ;;
+  down)
+    docker compose "${compose_files[@]}" down
+    ;;
+  status)
+    docker compose "${compose_files[@]}" ps
+    ;;
+  seed)
+    ./scripts/seed.sh
+    ;;
+  query)
+    sql="${1:-select count(*) as n from read_parquet(\"s3://lakehouse/demo/events.parquet\")}"
+    payload="$(jq -n \
+      --arg sql "$sql" \
+      --arg key "agent/ws1/results/manual.parquet" \
+      '{
+        sql: $sql,
+        output: {format: "parquet", s3_key: $key},
+        budget: {max_seconds: 20, max_scan_bytes: 268435456, max_output_bytes: 67108864, max_memory_mb: 512}
+      }'
+    )"
+    curl -sS -X POST http://localhost:8000/v1/run_sql \
+      -H 'content-type: application/json' \
+      -d "$payload" | jq .
+    ;;
+  smoke)
+    ./scripts/smoke.sh
+    ;;
+  validate)
+    ./scripts/full_validation.sh
+    ;;
+  browser)
+    echo "open http://localhost:8081"
+    ;;
+  logs)
+    service="${1:-api}"
+    docker compose "${compose_files[@]}" logs -f --tail=200 "$service"
+    ;;
+  prod-up)
+    if [ ! -f .env.production ]; then
+      echo "missing .env.production (copy from .env.production.example)"
+      exit 1
+    fi
+    ./scripts/preflight_production.sh .env.production
+    docker compose --env-file .env.production "${prod_compose_files[@]}" up -d --build
+    ;;
+  prod-down)
+    if [ -f .env.production ]; then
+      docker compose --env-file .env.production "${prod_compose_files[@]}" down
+    else
+      docker compose "${prod_compose_files[@]}" down
+    fi
+    ;;
+  completion)
+    shell="${1:-}"
+    case "$shell" in
+      bash)
+        cat ./scripts/completion/ducklake.bash
+        ;;
+      zsh)
+        cat ./scripts/completion/ducklake.zsh
+        ;;
+      *)
+        echo "usage: ./scripts/ducklake completion [bash|zsh]"
+        exit 1
+        ;;
+    esac
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    echo "unknown command: $cmd"
+    usage
+    exit 1
+    ;;
+esac
