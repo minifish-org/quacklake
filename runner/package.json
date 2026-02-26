@@ -9,7 +9,7 @@
     "test:coverage": "c8 --reporter=text --reporter=lcov node --test"
   },
   "dependencies": {
-    "@duckdb/duckdb-wasm": "1.30.0"
+    "@duckdb/duckdb-wasm": "1.32.0"
   },
   "devDependencies": {
     "c8": "^10.1.3"
