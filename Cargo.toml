@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 version = "0.1.0"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 axum = { version = "0.8", features = ["macros"] }
@@ -20,5 +20,5 @@ uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 aws-config = "1"
-aws-sdk-s3 = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 aws-smithy-types = "1"

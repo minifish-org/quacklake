@@ -1,12 +1,12 @@
 # Contributing
 
-Thanks for contributing to `ducklake-agent`.
+Thanks for contributing to `Quacklake`.
 
 ## Prerequisites
 
 - Docker + Docker Compose
-- Rust stable toolchain
-- Node.js 20+
+- Rust 1.94.1 toolchain (see rust-toolchain.toml)
+- Node.js 22+
 - `jq`
 
 ## Local development

@@ -16,7 +16,7 @@ services:
       RUNNER_AUTH_TOKENS: ${RUNNER_AUTH_TOKENS:?set RUNNER_AUTH_TOKENS}
       RUNNER_MAX_CONCURRENT_QUERIES: ${RUNNER_MAX_CONCURRENT_QUERIES:-8}
     restart: unless-stopped
-    ports: []
+    ports: !reset []
     read_only: true
     tmpfs:
       - /tmp:size=512m,noexec,nosuid,nodev
@@ -41,7 +41,7 @@ services:
 
   minio:
     restart: unless-stopped
-    ports: []
+    ports: !reset []
 
   browser:
     restart: unless-stopped

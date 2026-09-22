@@ -1,0 +1,7 @@
+**/.git
+**/node_modules
+**/target
+**/coverage
+**/.env
+**/.env.production
+**/.DS_Store

@@ -1,4 +1,4 @@
-# ducklake-agent
+# Quacklake
 
 WASM-first analytics prototype with:
 - DuckDB-WASM compute
@@ -18,6 +18,18 @@ WASM-first analytics prototype with:
 - `browser` (`:8081`): Browser DuckDB-WASM query UI
 - `minio` (`:9000`, console `:9001`): S3-compatible storage
 
+## Requirements and safety
+
+Requires Docker with Compose v2.24.4+, curl and jq. Rust 1.94.1 and Node.js 22 are needed only
+for native development. This is an experimental analytics prototype, not a
+production database or a security boundary for hostile SQL. The development
+profile uses public sample data and demonstration credentials, binds host ports
+to loopback, and must not be exposed directly to the internet.
+
+The demo pins upstream MinIO and mc images from Quay by digest. The MinIO
+community repository is archived; this dependency is suitable here for a local
+prototype, not a maintained production-storage recommendation.
+
 ## Quickstart
 
 ```bash
@@ -30,7 +42,8 @@ Then open [http://localhost:8081](http://localhost:8081).
 
 ## Easy mode (recommended)
 
-Use the helper CLI:
+The helper CLI retains its original `ducklake` command name:
+
 
 ```bash
 ./scripts/ducklake doctor
@@ -126,10 +139,11 @@ Minimum production settings:
 4. Tailnet-only exposure for service ports
 5. Rotate tokens/keys regularly
 
-## Security for Public Use
+## Network exposure
 
 - Preferred mode: Tailscale-only network access.
-- If internet-exposed:
+- The production override is a starting template, not a production-readiness guarantee.
+- Before any broader network exposure:
   - enable API auth (`API_KEYS` or `JWT_HS256_SECRET`)
   - keep `RUNNER_AUTH_TOKENS` enabled
   - set strict `CORS_ALLOWED_ORIGINS` (never `*`)
@@ -143,7 +157,7 @@ Minimum production settings:
 
 ## Open source
 
-- License: `LICENSE` (MIT)
+- License: [AGPL-3.0-only](LICENSE)
 - Contributing guide: `CONTRIBUTING.md`
 - Security policy: `SECURITY.md`
 - Code of conduct: `CODE_OF_CONDUCT.md`
