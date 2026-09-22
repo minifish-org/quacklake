@@ -1,7 +1,4 @@
 const DUCKDB_WASM_VERSION = '1.30.0';
-const duckdb = await import(
-  `https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@${DUCKDB_WASM_VERSION}/+esm`
-);
 
 const runBtn = document.getElementById('runBtn');
 const statusEl = document.getElementById('status');
@@ -25,6 +22,9 @@ async function getDb() {
   if (dbPromise) return dbPromise;
   dbPromise = (async () => {
     setStatus('initializing duckdb-wasm...');
+    const duckdb = await import(
+      `https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@${DUCKDB_WASM_VERSION}/+esm`
+    );
     const bundles = duckdb.getJsDelivrBundles();
     const bundle = await duckdb.selectBundle(bundles);
 
@@ -38,7 +38,10 @@ async function getDb() {
     URL.revokeObjectURL(workerUrl);
     setStatus('duckdb-wasm ready');
     return db;
-  })();
+  })().catch((err) => {
+    dbPromise = undefined;
+    throw err;
+  });
   return dbPromise;
 }
 
@@ -110,5 +113,5 @@ runBtn.addEventListener('click', async () => {
   }
 });
 
-// Enable only after the imported runtime and click handler are ready.
+// Enable only after the click handler is ready; import errors appear in the UI.
 runBtn.disabled = false;
