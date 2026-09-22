@@ -109,3 +109,6 @@ runBtn.addEventListener('click', async () => {
     }
   }
 });
+
+// Enable only after the imported runtime and click handler are ready.
+runBtn.disabled = false;

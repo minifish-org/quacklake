@@ -101,7 +101,7 @@
       <label for="sql" style="margin-top:10px">SQL (use <code>$PARQUET_URL</code> placeholder)</label>
       <textarea id="sql">select event_type, count(*) as n from read_parquet('$PARQUET_URL') group by 1 order by 2 desc</textarea>
 
-      <button id="runBtn">Run Query in Browser</button>
+      <button id="runBtn" disabled>Run Query in Browser</button>
     </section>
 
     <section class="panel">
